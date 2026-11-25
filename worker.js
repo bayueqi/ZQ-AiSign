@@ -1576,11 +1576,11 @@ async function putAccount(env, acct) {
 /* 与 WorkBuddy 服务端交互                                              */
 /* ------------------------------------------------------------------ */
 
-async function wbFetch(path, { method = 'POST', headers = {}, body = '{}', timeout = 20000 } = {}) {
+async function wbFetchHost(host, path, { method = 'POST', headers = {}, body = '{}', timeout = 20000 } = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeout);
   try {
-    const res = await fetch(API + path, {
+    const res = await fetch(host + path, {
       method,
       headers: {
         'Content-Type': 'application/json',
@@ -1601,6 +1601,10 @@ async function wbFetch(path, { method = 'POST', headers = {}, body = '{}', timeo
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function wbFetch(path, opts = {}) {
+  return wbFetchHost(API, path, opts);
 }
 
 /**
@@ -1737,25 +1741,29 @@ async function checkinStatus(at) {
  * total_credits 是「累计发放量」，只增不减，拿来做余额会一直不变。
  */
 async function queryBalance(at) {
-  const { status, json } = await wbFetch('/v2/billing/meter/get-user-resource-summary', {
-    headers: authHeader(at),
-  });
-  if (json?.code !== 0 || !json?.data) {
-    return { ok: false, code: json?.code, msg: json?.msg, http: status };
+  // 余额接口的口径是 codebuddy.cn / workbuddy.cn 这套，而不是 copilot.tencent.com
+  // （官方客户端查额度走的是 www.codebuddy.cn，copilot.tencent.com 上没有这个接口）
+  let lastErr = '';
+  for (const host of ['https://www.codebuddy.cn', 'https://www.workbuddy.cn']) {
+    const { status, json } = await wbFetchHost(host, '/billing/meter/get-user-resource-summary', {
+      headers: { ...authHeader(at), 'X-Domain': 'copilot.tencent.com' },
+    });
+    if (status === 404) { lastErr = '额度接口不可用'; continue; }
+    if (json?.code !== 0 || !json?.data) { lastErr = json?.msg || ('HTTP ' + status); continue; }
+    const d = json.data;
+    let remain = d.TotalCredits;
+    if (remain === null || remain === undefined || remain === '') {
+      const groups = Array.isArray(d.CreditGroups) ? d.CreditGroups : [];
+      remain = groups.reduce((acc, g) => {
+        const v = parseFloat(g && (g.CycleRemainCapacity ?? g.cycleRemainCapacity));
+        return acc + (isNaN(v) ? 0 : v);
+      }, 0);
+    }
+    const num = parseFloat(remain);
+    if (isNaN(num)) { lastErr = '额度接口未返回可读字段'; continue; }
+    return { ok: true, balance: num };
   }
-  const d = json.data;
-  // TotalCredits 实时剩余；取不到时退回 CreditGroups 的 CycleRemainCapacity 之和
-  let remain = d.TotalCredits;
-  if (remain === null || remain === undefined || remain === '') {
-    const groups = Array.isArray(d.CreditGroups) ? d.CreditGroups : [];
-    remain = groups.reduce((acc, g) => {
-      const v = parseFloat(g && (g.CycleRemainCapacity ?? g.cycleRemainCapacity));
-      return acc + (isNaN(v) ? 0 : v);
-    }, 0);
-  }
-  const num = parseFloat(remain);
-  if (isNaN(num)) return { ok: false, msg: '额度接口未返回可读字段' };
-  return { ok: true, balance: num };
+  return { ok: false, msg: lastErr || '余额查询失败' };
 }
 
 async function doCheckin(at) {
