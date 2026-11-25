@@ -3351,9 +3351,21 @@ async function handleLoginStart(request, env) {
 async function handleLoginPoll(request, env) {
   const url = new URL(request.url);
   const nonce = String(url.searchParams.get('nonce') ?? '').trim();
-  const code = String(url.searchParams.get('code') ?? '').trim();
+  let code = String(url.searchParams.get('code') ?? '').trim();
   if (!nonce) return json({ error: '缺少 nonce' }, 400);
   if (!code) return json({ status: 'pending' });
+
+  // 前端可能把整段回调链接（http://127.0.0.1:PORT/oauth/callback?code=…）
+  // 直接当 code 传进来，这里统一解出真正的授权码。
+  if (/^https?:\/\//i.test(code) || code.includes('?')) {
+    try {
+      const parsed = new URL(code);
+      const inner = parsed.searchParams.get('code');
+      if (inner) code = inner.trim();
+    } catch {
+      // 不是合法 URL，按原样当 code 用
+    }
+  }
 
   const raw = await env.CA_KV.get(loginKey(nonce));
   if (!raw) return json({ error: '授权会话已过期，请重新点「添加账号」' }, 400);
@@ -5177,7 +5189,17 @@ function claimCodeArts(){
   if(!url || btn.disabled) return;
   $('#codeartsQrErr').textContent = '';
   btn.disabled = true; btn.textContent = '绑定中…';
-  api('/codearts/api/login/poll?nonce=' + encodeURIComponent(codeartsNonce) + '&code=' + encodeURIComponent(url))
+  // 从粘贴的回调链接里解出真正的授权码，避免把整段 URL 当 code 传
+  var code = '';
+  try {
+    var u = new URL(url);
+    code = u.searchParams.get('code') || '';
+  } catch(e) {
+    code = '';
+  }
+  if(!code){ $('#codeartsQrErr').textContent = '没在链接里找到 code，请确认复制的是回调地址整段链接'; return; }
+
+  api('/codearts/api/login/poll?nonce=' + encodeURIComponent(codeartsNonce) + '&code=' + encodeURIComponent(code))
     .then(function(d){
       if(d.status === 'ok'){
         $('#codeartsQrStatus').textContent = '授权成功，已保存为「' + d.label + '」';
