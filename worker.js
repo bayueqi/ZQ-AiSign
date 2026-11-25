@@ -46,6 +46,143 @@
 
 
 /* ================================================================== */
+/* 公共层：四个模块共用的 JSON / 鉴权 / 账号加密与 KV 存取              */
+/* ================================================================== */
+
+const Core = (() => {
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+
+  function b64encode(buf) {
+    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    let s = '';
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+  }
+
+  function b64decode(str) {
+    const bin = atob(String(str).replace(/\s+/g, ''));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function json(data, status = 200) {
+    return new Response(JSON.stringify(data, null, 2), {
+      status,
+      headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
+    });
+  }
+
+  async function readBody(request) {
+    try {
+      return await request.json();
+    } catch {
+      return {};
+    }
+  }
+
+  /** 定长比较，避免口令被时序侧信道猜出来 */
+  function timingSafeEqual(a, b) {
+    const x = enc.encode(String(a ?? ''));
+    const y = enc.encode(String(b ?? ''));
+    if (x.length !== y.length) return false;
+    let diff = 0;
+    for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+    return diff === 0;
+  }
+
+  function requireAdmin(request, env) {
+    const url = new URL(request.url);
+    const given =
+      request.headers.get('X-Admin-Token') ||
+      (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '') ||
+      url.searchParams.get('token');
+    if (!env.ADMIN_TOKEN) return { ok: false, res: json({ error: '未配置 ADMIN_TOKEN' }, 500) };
+    if (!timingSafeEqual(given, env.ADMIN_TOKEN)) return { ok: false, res: json({ error: '登录密码不正确' }, 401) };
+    return { ok: true };
+  }
+
+  function requireCron(request, env) {
+    const secret = env.CRON_SECRET || env.ADMIN_TOKEN;
+    const url = new URL(request.url);
+    const given = request.headers.get('X-Cron-Secret') || url.searchParams.get('key');
+    if (!secret) return { ok: false, res: json({ error: '未配置 CRON_SECRET / ADMIN_TOKEN' }, 500) };
+    if (!timingSafeEqual(given, secret)) return { ok: false, res: json({ error: '口令不对' }, 401) };
+    return { ok: true };
+  }
+
+  /**
+   * 账号存储工厂：AES-256-GCM + 每条随机 salt，密钥由主密钥 HKDF 派生。
+   * 各平台仅 kvKey / masterKeyName / HKDF info 不同，逻辑完全一致。
+   */
+  function makeStore({ kvKey, masterKeyName, info }) {
+    const acctKey = (id) => `acct:${id}`;
+    const INDEX_KEY = 'index:accounts';
+
+    async function deriveKey(env, salt) {
+      const raw = env[masterKeyName];
+      if (!raw) throw new Error('缺少 MASTER_KEY');
+      let master;
+      try {
+        master = b64decode(raw.trim());
+      } catch {
+        throw new Error('MASTER_KEY 不是合法 base64');
+      }
+      if (master.length !== 32) throw new Error('MASTER_KEY 必须是 32 字节（base64 后 44 字符）');
+      const base = await crypto.subtle.importKey('raw', master, 'HKDF', false, ['deriveKey']);
+      return crypto.subtle.deriveKey(
+        { name: 'HKDF', hash: 'SHA-256', salt, info: enc.encode(info) },
+        base,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+      );
+    }
+
+    async function sealRecord(env, obj) {
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const key = await deriveKey(env, salt);
+      const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(JSON.stringify(obj)));
+      return JSON.stringify({ v: 1, s: b64encode(salt), i: b64encode(iv), d: b64encode(ct) });
+    }
+
+    async function openRecord(env, text) {
+      const box = JSON.parse(text);
+      if (box.v !== 1) throw new Error('不认识的记录版本');
+      const key = await deriveKey(env, b64decode(box.s));
+      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64decode(box.i) }, key, b64decode(box.d));
+      return JSON.parse(dec.decode(pt));
+    }
+
+    async function listAccounts(env) {
+      const raw = await env[kvKey].get(INDEX_KEY);
+      return raw ? JSON.parse(raw) : [];
+    }
+
+    async function saveIndex(env, list) {
+      await env[kvKey].put(INDEX_KEY, JSON.stringify(list));
+    }
+
+    async function getAccount(env, id) {
+      const raw = await env[kvKey].get(acctKey(id));
+      if (!raw) return null;
+      return openRecord(env, raw);
+    }
+
+    async function putAccount(env, acct) {
+      await env[kvKey].put(acctKey(acct.id), await sealRecord(env, acct));
+    }
+
+    return { acctKey, INDEX_KEY, deriveKey, sealRecord, openRecord, listAccounts, saveIndex, getAccount, putAccount };
+  }
+
+  return { json, readBody, timingSafeEqual, requireAdmin, requireCron, makeStore };
+})();
+
+
+/* ================================================================== */
 /* 模块一：Trae —— 设备身份 / 扫码授权 / 签到 */
 /* ================================================================== */
 
@@ -130,57 +267,7 @@ function randomHex(bytes = 16) {
   return s;
 }
 
-/** 定长比较，避免口令被时序侧信道猜出来 */
-function timingSafeEqual(a, b) {
-  const x = enc.encode(String(a ?? ''));
-  const y = enc.encode(String(b ?? ''));
-  if (x.length !== y.length) return false;
-  let diff = 0;
-  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
-  return diff === 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* 加密：AES-256-GCM + 每条记录随机 salt，密钥由主密钥 HKDF 派生        */
-/* ------------------------------------------------------------------ */
-
-async function deriveKey(env, salt) {
-  const raw = env.TRAE_MASTER_KEY;
-  if (!raw) throw new Error('缺少 MASTER_KEY');
-
-  let master;
-  try {
-    master = b64decode(raw.trim());
-  } catch {
-    throw new Error('MASTER_KEY 不是合法 base64');
-  }
-  if (master.length !== 32) throw new Error('MASTER_KEY 必须是 32 字节（base64 后 44 字符）');
-
-  const base = await crypto.subtle.importKey('raw', master, 'HKDF', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt, info: enc.encode('trae-signin/v1/account') },
-    base,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
-}
-
-async function sealRecord(env, obj) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveKey(env, salt);
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(JSON.stringify(obj)));
-  return JSON.stringify({ v: 1, s: b64encode(salt), i: b64encode(iv), d: b64encode(ct) });
-}
-
-async function openRecord(env, text) {
-  const box = JSON.parse(text);
-  if (box.v !== 1) throw new Error('不认识的记录版本');
-  const key = await deriveKey(env, b64decode(box.s));
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64decode(box.i) }, key, b64decode(box.d));
-  return JSON.parse(dec.decode(pt));
-}
+/* 加密与账号存取统一由顶层 Core 提供（见下方 KV 段） */
 
 /* ------------------------------------------------------------------ */
 /* ECDSA：P-256 / SHA-256，输出 base64(DER)，低 s 归一化               */
@@ -515,30 +602,11 @@ async function creditsOf(token, acct) {
 }
 
 /* ------------------------------------------------------------------ */
-/* KV 读写                                                             */
+/* 账号 KV 读写：复用顶层 Core                                          */
 /* ------------------------------------------------------------------ */
 
-const acctKey = (id) => `acct:${id}`;
-const INDEX_KEY = 'index:accounts';
-
-async function listAccounts(env) {
-  const raw = await env.TRAE_KV.get(INDEX_KEY);
-  return raw ? JSON.parse(raw) : [];
-}
-
-async function saveIndex(env, list) {
-  await env.TRAE_KV.put(INDEX_KEY, JSON.stringify(list));
-}
-
-async function getAccount(env, id) {
-  const raw = await env.TRAE_KV.get(acctKey(id));
-  if (!raw) return null;
-  return openRecord(env, raw);
-}
-
-async function putAccount(env, acct) {
-  await env.TRAE_KV.put(acctKey(acct.id), await sealRecord(env, acct));
-}
+const traeStore = Core.makeStore({ kvKey: 'TRAE_KV', masterKeyName: 'TRAE_MASTER_KEY', info: 'trae-signin/v1/account' });
+const { acctKey, INDEX_KEY, listAccounts, saveIndex, getAccount, putAccount, sealRecord, openRecord } = traeStore;
 
 /* ------------------------------------------------------------------ */
 /* 时间与账号状态辅助                                                   */
@@ -676,9 +744,6 @@ async function signinOne(env, acct, { force = false } = {}) {
   acct.lastState = 'checked';
   acct.lastMsg = res.points ? `+${res.points} 积分` : '签到成功';
   acct.lastOkDate = today;
-  acct.lastCredit = res.points ?? null;
-  acct.totalCredit = (acct.totalCredit ?? 0) + (Number(res.points) || 0);
-  acct.totalSigned = (acct.totalSigned ?? 0) + 1;
   acct.credits = bal ?? credits ?? acct.credits ?? null;
   acct.checkedIn = true;
   acct.cooldownUntil = 0;
@@ -697,40 +762,7 @@ async function signinOne(env, acct, { force = false } = {}) {
 /* 页面与鉴权辅助                                                       */
 /* ------------------------------------------------------------------ */
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
-  });
-}
-
-function requireAdmin(request, env) {
-  const url = new URL(request.url);
-  const given =
-    request.headers.get('X-Admin-Token') ||
-    (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '') ||
-    url.searchParams.get('token');
-  if (!env.ADMIN_TOKEN) return { ok: false, res: json({ error: '未配置 ADMIN_TOKEN' }, 500) };
-  if (!timingSafeEqual(given, env.ADMIN_TOKEN)) return { ok: false, res: json({ error: '登录密码不正确' }, 401) };
-  return { ok: true };
-}
-
-function requireCron(request, env) {
-  const secret = env.CRON_SECRET || env.ADMIN_TOKEN;
-  const url = new URL(request.url);
-  const given = request.headers.get('X-Cron-Secret') || url.searchParams.get('key');
-  if (!secret) return { ok: false, res: json({ error: '未配置 CRON_SECRET / ADMIN_TOKEN' }, 500) };
-  if (!timingSafeEqual(given, secret)) return { ok: false, res: json({ error: '口令不对' }, 401) };
-  return { ok: true };
-}
-
-async function readBody(request) {
-  try {
-    return await request.json();
-  } catch {
-    return {};
-  }
-}
+const { json, readBody, requireAdmin, requireCron } = Core;
 
 async function handleRemove(request, env) {
   const body = await readBody(request);
@@ -776,10 +808,7 @@ async function handleList(request, env) {
       lastMsg: a.lastMsg,
       lastRun: a.lastRun ? new Date(a.lastRun + 8 * 3600e3).toISOString().replace('Z', ' +08:00') : null,
       lastOkDate: a.lastOkDate ?? null,
-      lastCredit: a.lastCredit ?? null,
       credits: typeof a.credits === 'number' ? Math.round(a.credits * 100) / 100 : null,
-      totalCredit: a.totalCredit ?? 0,
-      totalSigned: a.totalSigned ?? 0,
       cooldownUntil: Number(a.cooldownUntil || 0) > now ? a.cooldownUntil : 0,
       hasKeys: !!(a.privateKeyPem && a.publicKeyPem),
       hasDevice: !!String(a.deviceId || '').trim(),
@@ -1486,91 +1515,14 @@ function randomId(bytes = 12) {
   return b64urlEncode(crypto.getRandomValues(new Uint8Array(bytes)));
 }
 
-/** 定长比较，避免口令被时序侧信道猜出来 */
-function timingSafeEqual(a, b) {
-  const x = enc.encode(String(a ?? ''));
-  const y = enc.encode(String(b ?? ''));
-  if (x.length !== y.length) return false;
-  let diff = 0;
-  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
-  return diff === 0;
-}
+/* 加密与账号存取统一由顶层 Core 提供（见下方 KV 段） */
 
 /* ------------------------------------------------------------------ */
-/* 加密：AES-256-GCM + 每条记录随机 salt，密钥由主密钥 HKDF 派生        */
+/* 账号 KV 读写：复用顶层 Core                                          */
 /* ------------------------------------------------------------------ */
 
-async function deriveKey(env, salt) {
-  const raw = env.WB_MASTER_KEY;
-  if (!raw) throw new Error('缺少 MASTER_KEY');
-
-  let master;
-  try {
-    master = b64decode(raw.trim());
-  } catch {
-    throw new Error('MASTER_KEY 不是合法 base64');
-  }
-  if (master.length !== 32) throw new Error('MASTER_KEY 必须是 32 字节（base64 后 44 字符）');
-
-  const base = await crypto.subtle.importKey('raw', master, 'HKDF', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt, info: enc.encode('wb-signin/v1/account') },
-    base,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
-}
-
-async function sealRecord(env, obj) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveKey(env, salt);
-  const ct = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    enc.encode(JSON.stringify(obj))
-  );
-  return JSON.stringify({ v: 1, s: b64encode(salt), i: b64encode(iv), d: b64encode(ct) });
-}
-
-async function openRecord(env, text) {
-  const box = JSON.parse(text);
-  if (box.v !== 1) throw new Error('不认识的记录版本');
-  const key = await deriveKey(env, b64decode(box.s));
-  const pt = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: b64decode(box.i) },
-    key,
-    b64decode(box.d)
-  );
-  return JSON.parse(dec.decode(pt));
-}
-
-/* ------------------------------------------------------------------ */
-/* KV 读写                                                             */
-/* ------------------------------------------------------------------ */
-
-const acctKey = (id) => `acct:${id}`;
-const INDEX_KEY = 'index:accounts';
-
-async function listAccounts(env) {
-  const raw = await env.WB_KV.get(INDEX_KEY);
-  return raw ? JSON.parse(raw) : [];
-}
-
-async function saveIndex(env, list) {
-  await env.WB_KV.put(INDEX_KEY, JSON.stringify(list));
-}
-
-async function getAccount(env, id) {
-  const raw = await env.WB_KV.get(acctKey(id));
-  if (!raw) return null;
-  return openRecord(env, raw);
-}
-
-async function putAccount(env, acct) {
-  await env.WB_KV.put(acctKey(acct.id), await sealRecord(env, acct));
-}
+const wbStore = Core.makeStore({ kvKey: 'WB_KV', masterKeyName: 'WB_MASTER_KEY', info: 'wb-signin/v1/account' });
+const { acctKey, INDEX_KEY, listAccounts, saveIndex, getAccount, putAccount, sealRecord, openRecord } = wbStore;
 
 /* ------------------------------------------------------------------ */
 /* 与 WorkBuddy 服务端交互                                              */
@@ -1734,12 +1686,7 @@ async function checkinStatus(at) {
   return { ok: true, data: json.data };
 }
 
-/**
- * 查询当前剩余额度（真正的「余额」）。
- * 口径对齐官方客户端：POST /v2/billing/meter/get-user-resource-summary，
- * data.TotalCredits 是实时剩余；老的 checkin-activity-status 里的
- * total_credits 是「累计发放量」，只增不减，拿来做余额会一直不变。
- */
+/** 查询当前剩余额度（真正的「余额」）：POST /billing/meter/get-user-resource-summary */
 async function queryBalance(at) {
   // 余额接口的口径是 codebuddy.cn / workbuddy.cn 这套，而不是 copilot.tencent.com
   // （官方客户端查额度走的是 www.codebuddy.cn，copilot.tencent.com 上没有这个接口）
@@ -1818,13 +1765,9 @@ async function signinOne(env, acct, { force = false } = {}) {
     return { id: acct.id, label: acct.label, state: 'error', msg: acct.lastMsg };
   }
 
-  let streak = null;
-  let total = null;
   try {
     const st = await checkinStatus(tokens.accessToken);
     if (st.ok) {
-      streak = st.data.streak_days ?? null;
-      total = st.data.total_credits ?? null;
       // 顺手把最新 accessToken 的服务端视图对上，用于判断是否真的已签
       if (st.data.checked_in_today === true && result.state === 'error') {
         result = { state: 'already', credit: 0 };
@@ -1835,8 +1778,6 @@ async function signinOne(env, acct, { force = false } = {}) {
   }
 
   acct.lastRun = now;
-  acct.streak = streak;
-  acct.total = total;
 
   if (result.state === 'error') {
     acct.lastState = 'error';
@@ -1845,10 +1786,6 @@ async function signinOne(env, acct, { force = false } = {}) {
     acct.lastState = result.state; // 'checked' | 'already'
     acct.lastMsg = result.state === 'checked' ? `+${result.credit} 积分` : '今日已签';
     acct.lastOkDate = today;
-    if (result.state === 'checked') {
-      acct.lastCredit = result.credit;
-      acct.totalSigned = (acct.totalSigned ?? 0) + 1;
-    }
   }
 
   await putAccount(env, acct);
@@ -1857,8 +1794,6 @@ async function signinOne(env, acct, { force = false } = {}) {
     label: acct.label,
     state: acct.lastState,
     msg: acct.lastMsg,
-    streak,
-    total,
   };
 }
 
@@ -1866,42 +1801,7 @@ async function signinOne(env, acct, { force = false } = {}) {
 /* 页面与鉴权辅助                                                       */
 /* ------------------------------------------------------------------ */
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
-  });
-}
-
-function requireAdmin(request, env) {
-  const url = new URL(request.url);
-  const given =
-    request.headers.get('X-Admin-Token') ||
-    (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '') ||
-    url.searchParams.get('token');
-  if (!env.ADMIN_TOKEN) return { ok: false, res: json({ error: '未配置 ADMIN_TOKEN' }, 500) };
-  if (!timingSafeEqual(given, env.ADMIN_TOKEN)) {
-    return { ok: false, res: json({ error: '登录密码不正确' }, 401) };
-  }
-  return { ok: true };
-}
-
-function requireCron(request, env) {
-  const secret = env.CRON_SECRET || env.ADMIN_TOKEN;
-  const url = new URL(request.url);
-  const given = request.headers.get('X-Cron-Secret') || url.searchParams.get('key');
-  if (!secret) return { ok: false, res: json({ error: '未配置 CRON_SECRET / ADMIN_TOKEN' }, 500) };
-  if (!timingSafeEqual(given, secret)) return { ok: false, res: json({ error: '口令不对' }, 401) };
-  return { ok: true };
-}
-
-async function readBody(request) {
-  try {
-    return await request.json();
-  } catch {
-    return {};
-  }
-}
+const { json, readBody, requireAdmin, requireCron } = Core;
 
 /* ------------------------------------------------------------------ */
 /* 路由                                                                */
@@ -1975,9 +1875,7 @@ async function handleList(request, env) {
       lastMsg: a.lastMsg,
       lastRun: a.lastRun ? new Date(a.lastRun + 8 * 3600e3).toISOString().replace('Z', ' +08:00') : null,
       lastOkDate: a.lastOkDate ?? null,
-      streak: a.streak ?? null,
       balance: bal.ok && bal.balance !== null && bal.balance !== undefined ? bal.balance : null,
-      totalSigned: a.totalSigned ?? 0,
       // 永远不返回令牌，连指纹都不给
     });
   }
@@ -2180,15 +2078,6 @@ function randomHex(bytes = 16) {
   return s;
 }
 
-function timingSafeEqual(a, b) {
-  const x = enc.encode(String(a ?? ''));
-  const y = enc.encode(String(b ?? ''));
-  if (x.length !== y.length) return false;
-  let diff = 0;
-  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
-  return diff === 0;
-}
-
 /* 令牌若是 JWT，载荷里可能带昵称；只当备注用，不校验签名 */
 function jwtClaims(tok) {
   const parts = String(tok || '').split('.');
@@ -2200,74 +2089,15 @@ function jwtClaims(tok) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* 加密：AES-256-GCM + 每条记录随机 salt，密钥由主密钥 HKDF 派生        */
-/* ------------------------------------------------------------------ */
-
-async function deriveKey(env, salt) {
-  const raw = env.QODER_MASTER_KEY;
-  if (!raw) throw new Error('缺少 MASTER_KEY');
-
-  let master;
-  try {
-    master = b64decode(raw.trim());
-  } catch {
-    throw new Error('MASTER_KEY 不是合法 base64');
-  }
-  if (master.length !== 32) throw new Error('MASTER_KEY 必须是 32 字节（base64 后 44 字符）');
-
-  const base = await crypto.subtle.importKey('raw', master, 'HKDF', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt, info: enc.encode('qoder-signin/v1/account') },
-    base,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
-}
-
-async function sealRecord(env, obj) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveKey(env, salt);
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(JSON.stringify(obj)));
-  return JSON.stringify({ v: 1, s: b64encode(salt), i: b64encode(iv), d: b64encode(ct) });
-}
-
-async function openRecord(env, text) {
-  const box = JSON.parse(text);
-  if (box.v !== 1) throw new Error('不认识的记录版本');
-  const key = await deriveKey(env, b64decode(box.s));
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64decode(box.i) }, key, b64decode(box.d));
-  return JSON.parse(dec.decode(pt));
-}
+/* 加密与账号存取统一由顶层 Core 提供（见下方 KV 段） */
 
 /* ------------------------------------------------------------------ */
-/* KV 读写                                                             */
+/* 账号 KV 读写：复用顶层 Core                                          */
 /* ------------------------------------------------------------------ */
 
-const acctKey = (id) => `acct:${id}`;
-const INDEX_KEY = 'index:accounts';
 const loginKey = (nonce) => `login:${nonce}`;
-
-async function listAccounts(env) {
-  const raw = await env.QODER_KV.get(INDEX_KEY);
-  return raw ? JSON.parse(raw) : [];
-}
-
-async function saveIndex(env, list) {
-  await env.QODER_KV.put(INDEX_KEY, JSON.stringify(list));
-}
-
-async function getAccount(env, id) {
-  const raw = await env.QODER_KV.get(acctKey(id));
-  if (!raw) return null;
-  return openRecord(env, raw);
-}
-
-async function putAccount(env, acct) {
-  await env.QODER_KV.put(acctKey(acct.id), await sealRecord(env, acct));
-}
+const qoderStore = Core.makeStore({ kvKey: 'QODER_KV', masterKeyName: 'QODER_MASTER_KEY', info: 'qoder-signin/v1/account' });
+const { acctKey, INDEX_KEY, listAccounts, saveIndex, getAccount, putAccount, sealRecord, openRecord } = qoderStore;
 
 const bjDay = (ms = Date.now()) => new Date(ms + 8 * 3600e3).toISOString().slice(0, 10);
 
@@ -2460,8 +2290,6 @@ async function persistAccount(env, { accessToken, refreshToken, userId, email, m
     createdAt: Date.now(),
     lastState: 'new',
     lastMsg: '授权完成，尚未运行',
-    totalCredit: 0,
-    totalSigned: 0,
     cooldownUntil: 0,
     via: String(via || ''),
   };
@@ -2769,9 +2597,6 @@ async function signinOne(env, acct, { force = false } = {}) {
     } else {
       acct.lastState = 'checked';
       acct.lastOkDate = today;
-      acct.lastCredit = amount;
-      acct.totalCredit = Number(acct.totalCredit || 0) + amount;
-      acct.totalSigned = Number(acct.totalSigned || 0) + 1;
       acct.lastMsg = '领取成功 +' + amount + ' credits' + typeTag;
     }
   } else if (claim.status === 429) {
@@ -2835,9 +2660,6 @@ async function handleList(request, env) {
       lastMsg: a.lastMsg,
       lastRun: a.lastRun ? new Date(a.lastRun + 8 * 3600e3).toISOString().replace('Z', ' +08:00') : null,
       lastOkDate: a.lastOkDate ?? null,
-      lastCredit: a.lastCredit ?? null,
-      totalCredit: a.totalCredit ?? 0,
-      totalSigned: a.totalSigned ?? 0,
       balance: bal.ok && bal.balance !== null && bal.balance !== undefined ? bal.balance : null,
       cooldownUntil: Number(a.cooldownUntil || 0) > now ? a.cooldownUntil : 0,
       today,
@@ -3011,40 +2833,7 @@ async function handleInspect(request, env) {
 /* ------------------------------------------------------------------ */
 /* 通用工具                                                            */
 /* ------------------------------------------------------------------ */
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
-  });
-}
-
-function requireAdmin(request, env) {
-  const url = new URL(request.url);
-  const given =
-    request.headers.get('X-Admin-Token') ||
-    (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '') ||
-    url.searchParams.get('token');
-  if (!env.ADMIN_TOKEN) return { ok: false, res: json({ error: '未配置 ADMIN_TOKEN' }, 500) };
-  if (!timingSafeEqual(given, env.ADMIN_TOKEN)) return { ok: false, res: json({ error: '登录密码不正确' }, 401) };
-  return { ok: true };
-}
-
-function requireCron(request, env) {
-  const secret = env.CRON_SECRET || env.ADMIN_TOKEN;
-  const url = new URL(request.url);
-  const given = request.headers.get('X-Cron-Secret') || url.searchParams.get('key');
-  if (!secret) return { ok: false, res: json({ error: '未配置 CRON_SECRET / ADMIN_TOKEN' }, 500) };
-  if (!timingSafeEqual(given, secret)) return { ok: false, res: json({ error: '口令不对' }, 401) };
-  return { ok: true };
-}
-
-async function readBody(request) {
-  try {
-    return await request.json();
-  } catch {
-    return {};
-  }
-}
+const { json, readBody, requireAdmin, requireCron } = Core;
 
 const __mod = {
   async fetch(request, env, ctx) {
@@ -3240,75 +3029,17 @@ async function sha256hex(data) {
   return Array.from(new Uint8Array(d)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-/* AES-256-GCM + 随机 salt，密钥由主密钥 HKDF 派生 */
-async function deriveKey(env, salt) {
-  const raw = env.CA_MASTER_KEY;
-  if (!raw) throw new Error('缺少 MASTER_KEY');
-  let master;
-  try {
-    master = b64decode(raw.trim());
-  } catch {
-    throw new Error('MASTER_KEY 不是合法 base64');
-  }
-  if (master.length !== 32) throw new Error('MASTER_KEY 必须是 32 字节（base64 后 44 字符）');
-  const base = await crypto.subtle.importKey('raw', master, 'HKDF', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt, info: enc.encode('codearts-signin/v1/account') },
-    base,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
-}
-async function sealRecord(env, obj) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveKey(env, salt);
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(JSON.stringify(obj)));
-  return JSON.stringify({ v: 1, s: b64encode(salt), i: b64encode(iv), d: b64encode(ct) });
-}
-async function openRecord(env, text) {
-  const box = JSON.parse(text);
-  if (box.v !== 1) throw new Error('不认识的记录版本');
-  const key = await deriveKey(env, b64decode(box.s));
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64decode(box.i) }, key, b64decode(box.d));
-  return JSON.parse(dec.decode(pt));
-}
+/* 加密与账号存取统一由顶层 Core 提供（见下方 KV 段） */
 
 /* ------------------------------------------------------------------ */
-/* KV 读写                                                             */
+/* 账号 KV 读写：复用顶层 Core                                          */
 /* ------------------------------------------------------------------ */
 
-const acctKey = (id) => `acct:${id}`;
-const INDEX_KEY = 'index:accounts';
 const loginKey = (nonce) => `login:${nonce}`;
-
-async function listAccounts(env) {
-  const raw = await env.CA_KV.get(INDEX_KEY);
-  return raw ? JSON.parse(raw) : [];
-}
-async function saveIndex(env, list) {
-  await env.CA_KV.put(INDEX_KEY, JSON.stringify(list));
-}
-async function getAccount(env, id) {
-  const raw = await env.CA_KV.get(acctKey(id));
-  if (!raw) return null;
-  return openRecord(env, raw);
-}
-async function putAccount(env, acct) {
-  await env.CA_KV.put(acctKey(acct.id), await sealRecord(env, acct));
-}
+const caStore = Core.makeStore({ kvKey: 'CA_KV', masterKeyName: 'CA_MASTER_KEY', info: 'codearts-signin/v1/account' });
+const { acctKey, INDEX_KEY, listAccounts, saveIndex, getAccount, putAccount, sealRecord, openRecord } = caStore;
 
 const bjDay = (ms = Date.now()) => new Date(ms + 8 * 3600e3).toISOString().slice(0, 10);
-
-function timingSafeEqual(a, b) {
-  const x = enc.encode(String(a ?? ''));
-  const y = enc.encode(String(b ?? ''));
-  if (x.length !== y.length) return false;
-  let diff = 0;
-  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
-  return diff === 0;
-}
 
 /* ------------------------------------------------------------------ */
 /* STS 令牌交换（授权码 / 刷新，都走同一个端点，带 DPoP）              */
@@ -3632,7 +3363,6 @@ async function persistAccount(env, r, jwk) {
     createdAt: Date.now(),
     lastState: 'new',
     lastMsg: '授权完成，尚未运行',
-    totalSigned: 0,
     cooldownUntil: 0,
   };
   await putAccount(env, acct);
@@ -3781,8 +3511,6 @@ async function signinOne(env, acct, { force = false } = {}) {
     const amount = target.benefitAmount || 0;
     acct.lastState = 'checked';
     acct.lastOkDate = today;
-    acct.lastCredit = amount;
-    acct.totalSigned = Number(acct.totalSigned || 0) + 1;
     acct.lastMsg = '领取成功' + (amount ? '（+' + amount + '）' : '');
   } else if (claim.code === CODE_NOT_YET) {
     acct.lastState = 'already';
@@ -3801,40 +3529,7 @@ async function signinOne(env, acct, { force = false } = {}) {
 /* 路由处理                                                            */
 /* ------------------------------------------------------------------ */
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
-  });
-}
-
-function requireAdmin(request, env) {
-  const url = new URL(request.url);
-  const given =
-    request.headers.get('X-Admin-Token') ||
-    (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '') ||
-    url.searchParams.get('token');
-  if (!env.ADMIN_TOKEN) return { ok: false, res: json({ error: '未配置 ADMIN_TOKEN' }, 500) };
-  if (!timingSafeEqual(given, env.ADMIN_TOKEN)) return { ok: false, res: json({ error: '登录密码不正确' }, 401) };
-  return { ok: true };
-}
-
-function requireCron(request, env) {
-  const secret = env.CRON_SECRET || env.ADMIN_TOKEN;
-  const url = new URL(request.url);
-  const given = request.headers.get('X-Cron-Secret') || url.searchParams.get('key');
-  if (!secret) return { ok: false, res: json({ error: '未配置 CRON_SECRET / ADMIN_TOKEN' }, 500) };
-  if (!timingSafeEqual(given, secret)) return { ok: false, res: json({ error: '口令不对' }, 401) };
-  return { ok: true };
-}
-
-async function readBody(request) {
-  try {
-    return await request.json();
-  } catch {
-    return {};
-  }
-}
+const { json, readBody, requireAdmin, requireCron } = Core;
 
 async function handleList(request, env) {
   const list = await listAccounts(env);
@@ -3868,8 +3563,6 @@ async function handleList(request, env) {
       lastMsg: a.lastMsg,
       lastRun: a.lastRun ? new Date(a.lastRun + 8 * 3600e3).toISOString().replace('Z', ' +08:00') : null,
       lastOkDate: a.lastOkDate ?? null,
-      lastCredit: a.lastCredit ?? null,
-      totalSigned: a.totalSigned ?? 0,
       balance: cr.ok && cr.balance !== null && cr.balance !== undefined ? cr.balance : null,
       tokenBalance: cr.ok && cr.tokenBalance !== null && cr.tokenBalance !== undefined ? cr.tokenBalance : null,
       plan: cr.plan || '',
@@ -4968,15 +4661,13 @@ function renderTrae(d){
   $('#lastRun-trae').textContent = lastRunOf(d.accounts);
   $('#cntTrae').textContent = d.accounts.filter(function(a){ return a.signedToday; }).length + '/' + d.accounts.length;
   if(!d.accounts.length){ box.innerHTML = '<div class="empty">还没有账号，右侧扫码添加</div>'; return; }
-  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>本次</th><th>余额</th><th>上次运行</th><th></th></tr></thead><tbody>'
+  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>余额</th><th>上次运行</th><th></th></tr></thead><tbody>'
     + d.accounts.map(function(a){
         var m = msgTrae(a);
-        var gain = (a.lastState==='checked' && a.lastCredit!=null) ? '+' + a.lastCredit : '—';
         return '<tr>'
           + '<td class="labcell" data-label="备注">' + labCellHtml('trae', a.id, a.label) + '</td>'
           + '<td class="st" data-label="状态">' + tagTrae(a, now)
             + (m ? '<div class="hint" style="margin:2px 0 0">' + esc(m) + '</div>' : '') + '</td>'
-          + '<td class="num" data-label="本次">' + gain + '</td>'
           + '<td class="num" data-label="余额">' + fmt(a.credits) + '</td>'
           + '<td class="time" data-label="上次运行">' + (a.lastRun ? esc(a.lastRun.replace('T',' ').slice(5,16)) : '—') + '</td>'
           + '<td data-label="操作"><button data-del="trae|' + esc(a.id) + '">删除</button></td>'
@@ -4998,14 +4689,13 @@ function renderWb(d){
   $('#lastRun-wb').textContent = lastRunOf(d.accounts);
   $('#cntWb').textContent = d.accounts.filter(function(a){ return a.signedToday; }).length + '/' + d.accounts.length;
   if(!d.accounts.length){ box.innerHTML = '<div class="empty">还没有账号，右侧扫码添加</div>'; return; }
-  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>连签</th><th>余额</th><th>上次运行</th><th></th></tr></thead><tbody>'
+  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>余额</th><th>上次运行</th><th></th></tr></thead><tbody>'
     + d.accounts.map(function(a){
         var m = msgWb(a);
         return '<tr>'
           + '<td class="labcell" data-label="备注">' + labCellHtml('wb', a.id, a.label) + '</td>'
           + '<td class="st" data-label="状态">' + tagWb(a)
             + (m ? '<div class="hint" style="margin:2px 0 0">' + esc(m) + '</div>' : '') + '</td>'
-          + '<td class="num" data-label="连签">' + (a.streak==null ? '—' : a.streak + ' 天') + '</td>'
           + '<td class="num" data-label="余额">' + (a.balance==null ? '—' : fmtNum(a.balance)) + '</td>'
           + '<td class="time" data-label="上次运行">' + (a.lastRun ? esc(a.lastRun.replace('T',' ').slice(5,16)) : '—') + '</td>'
           + '<td data-label="操作"><button data-del="wb|' + esc(a.id) + '">删除</button></td>'
@@ -5023,17 +4713,15 @@ function renderQoder(d){
   if(!d.accounts.length){ box.innerHTML = '<div class="empty">还没有账号，点右侧「添加账号（国内版）」</div>'; return; }
   var warn = '';
   box.innerHTML = warn
-    + '<table><thead><tr><th>备注</th><th>状态</th><th>本次</th><th>余额</th><th>上次运行</th><th></th></tr></thead><tbody>'
+    + '<table><thead><tr><th>备注</th><th>状态</th><th>余额</th><th>上次运行</th><th></th></tr></thead><tbody>'
     + d.accounts.map(function(a){
         var m = msgQoder(a);
-        var gain = (a.lastState==='checked' && a.lastCredit!=null) ? '+' + a.lastCredit : '—';
         var bal = (a.balance!=null) ? fmtNum(a.balance) : '—';
         var rgn = '<span class="rgn" title="国内版 qoder.com.cn">国内版</span>';
         return '<tr>'
           + '<td class="labcell" data-label="备注">' + labCellHtml('qoder', a.id, a.label, rgn) + '</td>'
           + '<td class="st" data-label="状态">' + tagQoder(a, now)
             + (m ? '<div class="hint" style="margin:2px 0 0">' + esc(m) + '</div>' : '') + '</td>'
-          + '<td class="num" data-label="本次">' + gain + '</td>'
           + '<td class="num" data-label="余额">' + bal + '</td>'
           + '<td class="time" data-label="上次运行">' + (a.lastRun ? esc(a.lastRun.replace('T',' ').slice(5,16)) : '—') + '</td>'
           + '<td data-label="操作" class="ops">'
@@ -5050,16 +4738,14 @@ function renderCodeArts(d){
   $('#lastRun-codearts').textContent = lastRunOf(d.accounts);
   $('#cntCodeArts').textContent = d.accounts.filter(function(a){ return a.signedToday; }).length + '/' + d.accounts.length;
   if(!d.accounts.length){ box.innerHTML = '<div class="empty">还没有账号，点右侧「添加账号」</div>'; return; }
-  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>本次</th><th>余额</th><th>上次运行</th><th></th></tr></thead><tbody>'
+  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>余额</th><th>上次运行</th><th></th></tr></thead><tbody>'
     + d.accounts.map(function(a){
         var m = msgCodeArts(a);
-        var gain = (a.lastState==='checked' && a.lastCredit!=null) ? '+' + a.lastCredit : '—';
         var bal = (a.balance!=null) ? fmt(a.balance) : '—';
         return '<tr>'
           + '<td class="labcell" data-label="备注">' + labCellHtml('codearts', a.id, a.label) + '</td>'
           + '<td class="st" data-label="状态">' + tagCodeArts(a, now)
             + (m ? '<div class="hint" style="margin:2px 0 0">' + esc(m) + '</div>' : '') + '</td>'
-          + '<td class="num" data-label="本次">' + gain + '</td>'
           + '<td class="num" data-label="余额">' + bal + '</td>'
           + '<td class="time" data-label="上次运行">' + (a.lastRun ? esc(a.lastRun.replace('T',' ').slice(5,16)) : '—') + '</td>'
           + '<td data-label="操作" class="ops">'
