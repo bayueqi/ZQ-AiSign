@@ -17,7 +17,7 @@
  *
  * 环境绑定（四个平台共用一个 KV，按 trae: / wb: / qoder: / codearts: 前缀隔离）：
  *
- *   KV 绑定    KV            （一个命名空间即可）
+ *   KV 绑定    AiSign        （一个命名空间即可）
  *   Secret     MASTER_KEY    32 字节随机值的 base64，四个平台共用
  *   Secret     ADMIN_TOKEN   控制台登录密码
  *   Secret     CRON_SECRET   （可选）/cron 独立口令，缺省回落到 ADMIN_TOKEN
@@ -3774,8 +3774,8 @@ function missingKV(hint) {
 }
 
 function kvFor(env, prefix) {
-  if (env.KV) return kvScope(env.KV, prefix);
-  return missingKV('未绑定 KV：请给 Worker 添加一个 KV 命名空间，变量名填 KV');
+  if (env.AiSign) return kvScope(env.AiSign, prefix);
+  return missingKV('未绑定 KV：请给 Worker 添加一个 KV 命名空间，变量名填 AiSign');
 }
 
 function traeEnv(env) {
@@ -4126,6 +4126,7 @@ const PAGE = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAAAAAAAAAQCEeRdzAAAEMElEQVR4nO1WX0wcRRz+ZnZvb+8WCpRSyhUsbQXTB6Ag1Kb1D8ZUX5q08cFgX4wvbexDbU3EhGi0GhMt8V+MMcqLxodqDEmt0QdfbNOoJLRBqomNSqUFOcoBB3c94G5352dm78qfu92jNKRq0t/d3N7OznzfN/P7ZmYZ/uVQ7wjAnRT8H1LAATS0tLb39Z45sVxbBmB7c2t7//kzJ8StCiiqamoOltfWgglGRLYW0Isrd+45PKaHJi0zlQAHk0wk2Rjhxn+CIFXzGxt2PXp4tKwilkrOTkFhChijuat//p64dPH8sgKqHjjy3Ka9nZ3k93HiAqQQiBPCMLFx2xNdpMCpE7LerXDCXzBR8tD+D0lN35MKkEiKifdfeX7iZNfbngL0YGFhaPfR9jmLc7ITueAiDSgyIvIWe+m9rft40YGD7ddPn+xKJq7HXQUUFwaMp1sN/eyQgEUcyIxIjhrOdeHeuWbq4FInu8+35wSuKXhsU5neaQSNsJcA0ybsb+T01CMaUqYv7ahVCs3HMB2ZoNcF5fdA0gI4A1Q56pWE9KLspzIQAZZFOSspmUXuKoAcLwPCpXG+YJxBYYQ/BoYRDPhRXr4etr2wEAUxB3tZASA4I1gJvcI5FJj49OuL+Oh7HaXaDN55xsLW6hBMKy1CYrqBqi786UIuJDztE1r0UFU4yJzDu1/145O+cnCtDJenIrgyMo2aLaF5HA9+5ArIzMBiQSrniE5GMR6L4+7KCkDxQQgBn48jmYjjzVO/onuwClqgCNZEDPvqRrGjvg7JFHniegpA1gzIkY+PT+DZ/gEM6mvQNtiHI7u3QwtoiEYmcfybS/guugVawIA1PoUnG4ZxtK0eqt9Y4gGvlKrZFc70OmrTXeSKGJ2aRr9RgvVVd+HzK9egnvsZj9dswEvnRvCjWQO/rgORcRxqGsPBfY0grsOy7CzgBcz8ArA0Xylb4J7KENqG+vDZmIHq0nXo/ptw6uw1hAO1UMkHdSqMY80xHNhzL1KkQNhZ5DftAVrI1bx5iKBofrzQUg/zp358UbAZm4tLEWcloChQEL+KjhYLe+9vcvYQQe5n4Dwm3aQHFodlC6hBAx0762H/8Au61WqowkBZ7DJe3aHhwaYGzMrl5uaylXsAro6VOVWCBejYVYfint8wEBc4dN86NG7biplU7pR74eYVQJlP+pvb2rItKMEgjj3cCGFbYD4/ZlLWsuQZ8AV8LwFw3izcN6IbIZeWk2XuA2U7PT9/5od5C2BMFs7zpHIR2MrOCtlcYksOTwHxeDwRjUZjFRvL1szOrOJZLI9jPyCxJYengFRyLn785RffeOu9D15bW7K2RG63qxGccwwPR6ISW3J4CpDx7ekvP+7t7bkQClWG3HauWwnGGEZGhkci4aEL2c9Ul/ZmJDzUEwkP4XaEeltY/ssC/gG7XjqAz5RTzAAAAABJRU5ErkJggg==">
 <title>签到控制台 · Trae + WorkBuddy + Qoder + CodeArts</title>
 <style>
   :root{
