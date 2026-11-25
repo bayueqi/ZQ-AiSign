@@ -1,41 +1,46 @@
 /**
- * ZQ-AiSign —— Trae + WorkBuddy + CodeArts 每日签到（Cloudflare Worker，单文件）
+ * ZQ-AiSign —— Trae + WorkBuddy + Qoder + CodeArts 每日签到（Cloudflare Worker，单文件）
  *
- * 一个 Worker 同时管理三个平台的每日签到：一套部署、一个控制台、一条定时任务。
- * 三个平台各自独立完成登录态维护与签到，账号数据存在同一个 KV 里，
- * 按 trae: / wb: / codearts: 前缀隔离，互不干扰。
+ * 一个 Worker 同时管理四个平台的每日签到：一套部署、一个控制台、一条定时任务。
+ * 四个平台各自独立完成登录态维护与签到，账号数据存在同一个 KV 里，
+ * 按 trae: / wb: / qoder: / codearts: 前缀隔离，互不干扰。
  *
  * 作者：bayueqi
  * 仓库：https://github.com/bayueqi/ZQ-AiSign
  *
- * 代码结构（四段）：
+ * 代码结构（五段）：
  *   1. Trae 模块       设备身份、抖音扫码授权、签到与积分查询
  *   2. WorkBuddy 模块  扫码授权、令牌轮换、签到
- *   3. CodeArts 模块   华为云 PKCE + DPoP 授权、SDK-HMAC-SHA256 签名签到、令牌续期
- *   4. 外壳            绑定适配 + 路由分发 + 控制台页面
+ *   3. Qoder 模块      设备授权（PKCE）、每日 credits 领取
+ *   4. CodeArts 模块   华为云 PKCE + DPoP 授权、SDK-HMAC-SHA256 签名签到、令牌续期
+ *   5. 外壳            绑定适配 + 路由分发 + 控制台页面 + Telegram 通知
  *
- * 环境绑定（三个平台共用一个 KV，按 trae: / wb: / codearts: 前缀隔离）：
+ * 环境绑定（四个平台共用一个 KV，按 trae: / wb: / qoder: / codearts: 前缀隔离）：
  *
  *   KV 绑定    KV            （一个命名空间即可）
- *   Secret     MASTER_KEY    32 字节随机值的 base64，三个平台共用
+ *   Secret     MASTER_KEY    32 字节随机值的 base64，四个平台共用
  *   Secret     ADMIN_TOKEN   控制台登录密码
  *   Secret     CRON_SECRET   （可选）/cron 独立口令，缺省回落到 ADMIN_TOKEN
+ *   Secret     TG_BOT_TOKEN / TG_CHAT_ID  （可选）Telegram 通知，也可在页面里配置
  *
  * 只认这几个名字，不需要按平台拆成多份绑定。
  *
  * 路由：
- *   /                     控制台（Trae / WorkBuddy / CodeArts 三个标签页）
- *   /cron                 定时入口，三个平台依次签到
+ *   /                     控制台（Trae / WorkBuddy / Qoder / CodeArts 四个标签页）
+ *   /cron                 定时入口，四个平台依次签到
  *   /api/ping             密码校验
- *   /api/run-all          三个平台一起签
+ *   /api/run-all          四个平台一起签
+ *   /api/notify           通知配置（读 / 写）
+ *   /api/notify/test      发送测试通知
  *   /trae/api/*           Trae 的管理接口
  *   /wb/api/*             WorkBuddy 的管理接口
+ *   /qoder/api/*          Qoder 的管理接口
  *   /codearts/api/*       CodeArts 的管理接口
  *   /oauth/callback       Trae 扫码回调（授权链接里写死这个路径，必须在根）
  *
  * Cron 配置（Cloudflare 的 cron 走 UTC，比北京时间慢 8 小时）：
  *   北京 08:10 = UTC 00:10    crons = ["10 0 * * *"]
- * 第一轮把三个平台各跑一遍；签到本身是幂等的（今天签过就跳过），
+ * 第一轮把四个平台各跑一遍；签到本身是幂等的（今天签过就跳过），
  * 想多兜几次只是在数组里多加一条时间。
  */
 
@@ -3908,147 +3913,13 @@ async function runAll(env, origin, force) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 签到结果通知：Telegram / QQ 官方机器人                              */
+/* 签到结果通知：Telegram 机器人                                        */
 /*                                                                     */
-/* 三个渠道都靠环境变量开关，配了哪个发哪个；全部没配就静默跳过。          */
+/* 靠环境变量或页面配置开启，没配就静默跳过。                             */
 /* 通知失败只记在返回值的 notifyError 里，绝不影响签到本身。              */
 /* ------------------------------------------------------------------ */
 
 const NOTIFY_TIMEOUT = 12000;
-
-/* 本机抓 openid 的脚本，从 /qq/openid-helper.mjs 下载 */
-const QQ_OPENID_HELPER = `#!/usr/bin/env node
-/**
- * 取 QQ 机器人给你的 user_openid
- *
- * 用法： node openid-helper.mjs <AppID> <AppSecret>
- *
- * 原理：WebSocket 是客户端主动往外连，不需要域名、不需要备案。
- * 连上后用 intents(1<<25) 订阅「私聊 / 群里 @」事件，你给机器人发一条消息，
- * 脚本从事件里取出 author.user_openid 打印出来，然后自己退出。
- *
- * 只依赖 Node 18+（内置 fetch 和 WebSocket）。
- */
-const [appId, secret] = process.argv.slice(2);
-
-if (!appId || !secret) {
-  console.error('用法: node openid-helper.mjs <AppID> <AppSecret>');
-  process.exit(1);
-}
-
-const TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken';
-const API = 'https://api.sgroup.qq.com';
-const INTENTS_GROUP_AND_C2C = 1 << 25;
-
-async function main() {
-  console.log('1/3 换取 access_token…');
-  const tr = await fetch(TOKEN_URL, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ appId, clientSecret: secret }),
-  });
-  const tj = await tr.json().catch(() => ({}));
-  if (!tj.access_token) {
-    console.error('✗ 换取 token 失败：' + JSON.stringify(tj));
-    console.error('  检查 AppID / AppSecret 是否正确。');
-    process.exit(1);
-  }
-
-  console.log('2/3 获取 WebSocket 网关…');
-  const gr = await fetch(API + '/gateway', {
-    headers: { authorization: 'QQBot ' + tj.access_token },
-  });
-  const gj = await gr.json().catch(() => ({}));
-  if (!gj.url) {
-    console.error('✗ 获取网关失败：' + JSON.stringify(gj));
-    process.exit(1);
-  }
-
-  console.log('3/3 已连接，请现在用手机 QQ 给机器人发一条私聊消息…');
-  console.log('    （60 秒内有效，收到后脚本会自己退出）');
-  console.log('');
-
-  const ws = new WebSocket(gj.url);
-  let seq = null;
-  let heartbeat = null;
-  const timer = setTimeout(() => {
-    console.error('✗ 超时：60 秒内没收到消息。');
-    console.error('  确认机器人已开通「私聊消息」权限，并且是直接私聊它。');
-    cleanup(1);
-  }, 60000);
-
-  function cleanup(code) {
-    clearTimeout(timer);
-    if (heartbeat) clearInterval(heartbeat);
-    try { ws.close(); } catch (e) {}
-    setTimeout(() => process.exit(code), 80);
-  }
-
-  ws.onopen = () => console.log('   连接已建立，等待鉴权…');
-
-  ws.onmessage = (ev) => {
-    let p2;
-    try { p2 = JSON.parse(ev.data); } catch (e) { return; }
-    if (p2.s) seq = p2.s;
-
-    if (p2.op === 10) {
-      ws.send(JSON.stringify({
-        op: 2,
-        d: {
-          token: 'QQBot ' + tj.access_token,
-          intents: INTENTS_GROUP_AND_C2C,
-          shard: [0, 1],
-          properties: { $os: 'linux', $browser: 'node', $device: 'node' },
-        },
-      }));
-      heartbeat = setInterval(() => {
-        try { ws.send(JSON.stringify({ op: 1, d: seq })); } catch (e) {}
-      }, 40000);
-      return;
-    }
-
-    if (p2.op === 9) {
-      console.error('✗ 鉴权失败：intents 没权限。去 q.qq.com 确认机器人开通了「私聊消息」事件。');
-      cleanup(1);
-      return;
-    }
-
-    if (p2.op !== 0 || !p2.t) return;
-
-    if (p2.t === 'READY') {
-      console.log('   鉴权通过，正在等你发消息…');
-      return;
-    }
-
-    const d = p2.d || {};
-    const author = d.author || {};
-    const oid = author.user_openid || author.member_openid || d.user_openid || '';
-    if (oid) {
-      console.log('');
-      console.log('==============================================');
-      console.log('✅ 拿到了 OpenID：');
-      console.log('');
-      console.log('   ' + oid);
-      console.log('');
-      console.log('事件类型: ' + p2.t);
-      console.log('==============================================');
-      console.log('');
-      console.log('把上面这串填进签到控制台 → 通知 → QQ 机器人的「OpenID」，保存即可。');
-      cleanup(0);
-      return;
-    }
-
-    console.log('   收到事件 ' + p2.t + '，不是消息事件，继续等…');
-  };
-
-  ws.onerror = () => console.error('   连接异常，继续等待…');
-}
-
-main().catch((e) => {
-  console.error('✗ ' + (e && e.message ? e.message : e));
-  process.exit(1);
-});
-`;
 
 /* 通知配置存在 KV 里（加密），环境变量只作为「还没在页面配过」时的默认值 */
 const NOTIFY_KEY = 'config';
@@ -4058,10 +3929,6 @@ function envNotifyDefaults(env) {
   const cfg = {};
   if (s('TG_BOT_TOKEN') || s('TG_CHAT_ID')) {
     cfg.telegram = { enabled: true, token: s('TG_BOT_TOKEN'), chatId: s('TG_CHAT_ID') };
-  }
-  if (s('QQ_APP_ID') || s('QQ_OPENID')) {
-    cfg.qq = { enabled: true, appId: s('QQ_APP_ID'), secret: s('QQ_APP_SECRET'),
-      openid: s('QQ_OPENID'), sandbox: /^(1|true|yes)$/i.test(s('QQ_SANDBOX')) };
   }
   return cfg;
 }
@@ -4137,33 +4004,16 @@ async function notifyChannels(env) {
     ch.telegram = { token: str(t.token), chatId: str(t.chatId) };
   }
 
-  const q = cfg.qq || {};
-  if (q.enabled !== false && str(q.appId) && str(q.secret) && str(q.openid)) {
-    ch.qq = {
-      appId: str(q.appId),
-      secret: str(q.secret),
-      openid: str(q.openid),
-      sandbox: !!q.sandbox,
-    };
-  }
-
   return ch;
 }
 
 /** 给前端看：密码类字段只回「有没有配」，不回明文 */
 async function notifyConfigForUi(env) {
   const cfg = await loadNotifyConfig(env);
-  const mask = (v) => (v ? '已配置 ·' + String(v).slice(-4) : '');
   const t = cfg.telegram || {};
-  const q = cfg.qq || {};
   return {
     // 明文字段：这个接口要 admin token 才能调，方便用户下次打开核对/修改
     telegram: { enabled: t.enabled !== false, token: t.token || '', chatId: t.chatId || '', tokenSet: !!t.token },
-    qq: {
-      enabled: q.enabled !== false,
-      appId: q.appId || '', secret: q.secret || '', secretSet: !!q.secret,
-      openid: q.openid || '', sandbox: !!q.sandbox,
-    },
     fromEnv: !(await kvFor(env, 'notify:').get(NOTIFY_KEY)),
   };
 }
@@ -4195,37 +4045,6 @@ async function sendTelegram(cfg, text) {
   });
   if (r.status >= 400 || r.json.ok === false) {
     throw new Error('Telegram HTTP ' + r.status + '：' + (r.json.description || r.text.slice(0, 120)));
-  }
-}
-
-/* ---- QQ 官方机器人（HTTP 主动消息，不走 WebSocket） ---- */
-let qqToken = null;
-
-async function qqAccessToken(cfg) {
-  if (qqToken && qqToken.appId === cfg.appId && qqToken.exp > Date.now()) return qqToken.token;
-  const r = await notifyFetch('https://bots.qq.com/app/getAppAccessToken', {
-    headers: { 'content-type': 'application/json' },
-    body: { appId: cfg.appId, clientSecret: cfg.secret },
-  });
-  const token = r.json.access_token || r.json.accessToken;
-  if (r.status >= 400 || !token) {
-    throw new Error('QQ 换 access_token 失败 HTTP ' + r.status + '：' + r.text.slice(0, 140));
-  }
-  const ttl = Number(r.json.expires_in || r.json.expiresIn || 7200);
-  qqToken = { appId: cfg.appId, token, exp: Date.now() + Math.max(60, ttl - 120) * 1000 };
-  return token;
-}
-
-async function sendQQ(cfg, text) {
-  // QQ 官方机器人：HTTP 主动消息（WebSocket 只用于接收事件，发消息用不上）
-  const token = await qqAccessToken(cfg);
-  const base = cfg.sandbox ? 'https://sandbox.api.sgroup.qq.com' : 'https://api.sgroup.qq.com';
-  const r = await notifyFetch(base + '/v2/users/' + encodeURIComponent(cfg.openid) + '/messages', {
-    headers: { 'content-type': 'application/json', authorization: 'QQBot ' + token },
-    body: { content: text, msg_type: 0 },
-  });
-  if (r.status >= 400) {
-    throw new Error('QQ 发送失败 HTTP ' + r.status + '：' + (r.json.message || r.text.slice(0, 140)));
   }
 }
 
@@ -4285,12 +4104,11 @@ function formatReport(result) {
 
 async function notifyRun(env, result) {
   const ch = await notifyChannels(env);
-  if (!ch.telegram && !ch.qq) return { skipped: true };
+  if (!ch.telegram) return { skipped: true };
 
   const text = formatReport(result);
   const jobs = [];
   if (ch.telegram) jobs.push(sendTelegram(ch.telegram, text).then(() => null, (e) => 'Telegram：' + (e.message || e)));
-  if (ch.qq) jobs.push(sendQQ(ch.qq, text).then(() => null, (e) => 'QQ：' + (e.message || e)));
 
   const errors = (await Promise.all(jobs)).filter(Boolean);
   return errors.length ? { errors } : { ok: true, channels: Object.keys(ch) };
@@ -5391,18 +5209,11 @@ function nvOpen(){
   $('#nvModal').hidden = false;
   $('#nvMsg').textContent = '';
   api('/api/notify').then(function(c){
-    var tg = c.telegram || {}, qq = c.qq || {};
+    var tg = c.telegram || {};
     $('#tgOn').checked = tg.enabled !== false;
     $('#tgChat').value = tg.chatId || '';
     $('#tgToken').value = tg.token || '';
     $('#tgToken').placeholder = '123456:ABC-DEF...';
-
-    $('#qqOn').checked = qq.enabled !== false;
-    $('#qqAppId').value = qq.appId || '';
-    $('#qqOpenid').value = qq.openid || '';
-    if(window.renderHelperCmds) window.renderHelperCmds();
-    $('#qqSecret').value = qq.secret || '';
-    $('#qqSecret').placeholder = 'AppSecret';
 
     if(c.fromEnv){ $('#nvMsg').textContent = '当前读的是环境变量，保存后会改存到 KV。'; }
   }).catch(function(e){
@@ -5416,12 +5227,6 @@ function nvPayload(){
       enabled: $('#tgOn').checked,
       token: $('#tgToken').value.trim(),
       chatId: $('#tgChat').value.trim(),
-    },
-    qq: {
-      enabled: $('#qqOn').checked,
-      appId: $('#qqAppId').value.trim(),
-      secret: $('#qqSecret').value.trim(),
-      openid: $('#qqOpenid').value.trim(),
     },
   };
 }
@@ -5465,29 +5270,6 @@ if(saved) login(saved);
           <p class="nv-tip">找 <b>@BotFather</b> 发 <code>/newbot</code> 拿 Token；先给 bot 发条消息，再访问 <code>api.telegram.org/bot&lt;token&gt;/getUpdates</code> 取 chat id。</p>
         </section>
 
-        <section class="nv-sec">
-          <label class="nv-h"><input type="checkbox" id="qqOn"> QQ 机器人</label>
-          <div class="nv-row"><span>AppID</span><input id="qqAppId" placeholder="q.qq.com 创建机器人后获得" autocomplete="off"></div>
-          <div class="nv-row"><span>AppSecret</span><input id="qqSecret" type="text" placeholder="同一页面的 AppSecret" autocomplete="off"></div>
-          <div class="nv-row"><span>OpenID</span><input id="qqOpenid" placeholder="user_openid，不是 QQ 号" autocomplete="off"></div>
-          <p class="nv-tip"><b>怎么拿</b>：本机终端跑下面这条，然后给机器人发条私聊消息，它会直接打印 OpenID。</p>
-          <div class="nv-os" id="qqHelperOs">
-            <button type="button" data-os="win" class="on">Windows</button>
-            <button type="button" data-os="mac">macOS / Linux</button>
-          </div>
-          <div class="nv-cmd">
-            <code id="qqHelperCmd">curl.exe -O {origin}/qq/openid-helper.mjs</code>
-            <button type="button" class="nv-copy" data-copy="qqHelperCmd">复制</button>
-          </div>
-          <div class="nv-cmd">
-            <code id="qqHelperRun">node openid-helper.mjs AppID AppSecret</code>
-            <button type="button" class="nv-copy" data-copy="qqHelperRun">复制</button>
-          </div>
-          <p class="nv-tip" id="qqHelperNote">两条<b>分开执行</b>（PowerShell 5 不认 &amp;&amp;）。第二条里的 AppID / AppSecret 换成上面填的值；跑起来后 60 秒内给机器人发条私聊，终端会打印 <code>user_openid</code>。</p>
-
-          <p class="nv-tip nv-warn">官方对「主动消息」有频次限制，超了会返回错误码。QQ 用户需要在 QQ 客户端机器人设置里打开「允许主动发送消息」。</p>
-        </section>
-
       </div>
       <div class="nv-foot">
         <span class="nv-msg" id="nvMsg"></span>
@@ -5499,33 +5281,6 @@ if(saved) login(saved);
 <script>
 /* 通知弹窗的绑定放这里：它必须等上面的弹窗 DOM 解析完 */
 (function(){
-  var helperOs = (function(){
-    var p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
-    return /mac|linux/i.test(p) ? 'mac' : 'win';
-  })();
-
-  window.renderHelperCmds = function(){
-    var el = document.getElementById('qqHelperCmd');
-    var run = document.getElementById('qqHelperRun');
-    if(el) el.textContent = (helperOs === 'mac' ? 'curl' : 'curl.exe') + ' -O ' + location.origin + '/qq/openid-helper.mjs';
-    if(run) run.textContent = 'node openid-helper.mjs AppID AppSecret';
-    var box = document.getElementById('qqHelperOs');
-    if(box) box.querySelectorAll('button').forEach(function(b){
-      b.classList.toggle('on', b.dataset.os === helperOs);
-    });
-    var note = document.getElementById('qqHelperNote');
-    if(note){
-      note.innerHTML = helperOs === 'mac'
-        ? '两条<b>依次执行</b>即可（macOS / Linux 上也可以直接用 <code>&amp;&amp;</code> 连起来）。第二条里的 AppID / AppSecret 换成上面填的值，跑起来后 60 秒内给机器人发条私聊。'
-        : '两条<b>分开执行</b>（PowerShell 5 不认 <code>&amp;&amp;</code>）。第二条里的 AppID / AppSecret 换成上面填的值，跑起来后 60 秒内给机器人发条私聊。';
-    }
-  };
-
-  var osBox = document.getElementById('qqHelperOs');
-  if(osBox) osBox.querySelectorAll('button').forEach(function(b){
-    b.onclick = function(){ helperOs = b.dataset.os; window.renderHelperCmds(); };
-  });
-
   var open = document.getElementById('notifyOpen');
   if(open) open.onclick = nvOpen;
 
@@ -5622,13 +5377,6 @@ export default {
         return json(await runAll(env, url.origin, force));
       }
 
-      // 本机脚本：用 WebSocket 抓 user_openid（不需要域名/备案）
-      if (path === '/qq/openid-helper.mjs' && method === 'GET') {
-        return new Response(QQ_OPENID_HELPER, {
-          headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' },
-        });
-      }
-
       // 通知配置：读（脱敏）/ 写
       if (path === '/api/notify' && method === 'GET') {
         const a = requireAdmin(request, env);
@@ -5647,20 +5395,12 @@ export default {
         };
 
         const tIn = body.telegram || {};
-        const qIn = body.qq || {};
 
         const cfg = {
           telegram: {
             enabled: tIn.enabled !== false,
             token: pick(tIn, 'token', prev.telegram),
             chatId: String(tIn.chatId ?? '').trim(),
-          },
-          qq: {
-            enabled: qIn.enabled !== false,
-            appId: String(qIn.appId ?? '').trim(),
-            secret: pick(qIn, 'secret', prev.qq),
-            openid: String(qIn.openid ?? '').trim(),
-            sandbox: !!qIn.sandbox,
           },
         };
         await saveNotifyConfig(env, cfg);
@@ -5675,7 +5415,7 @@ export default {
         if (!a.ok) return a.res;
         const ch = await notifyChannels(env);
         if (!Object.keys(ch).length) {
-          return json({ error: '还没有配置通知渠道：先在页面里把 Telegram 或 QQ 机器人填好' }, 400);
+          return json({ error: '还没有配置通知渠道：先在页面里把 Telegram 填好' }, 400);
         }
         const demo = {
           at: new Date(Date.now() + 8 * 3600e3).toISOString().replace('Z', ' +08:00'),
@@ -5710,7 +5450,7 @@ export default {
     }
   },
 
-  /** Cloudflare Cron Trigger：三个平台依次签到，互不影响 */
+  /** Cloudflare Cron Trigger：四个平台依次签到，互不影响 */
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
