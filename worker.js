@@ -2131,6 +2131,7 @@ const EP = {
   poll: '/api/v1/deviceToken/poll',
   refresh: '/api/v1/deviceToken/refresh',
   campaigns: '/sash/api/v1/me/campaigns',
+  usage: '/sash/api/v2/me/usage',
 };
 
 const CLIENT_TYPE = '10';
@@ -2507,6 +2508,59 @@ async function refreshAccount(acct) {
   return token;
 }
 
+/**
+ * 查询账户当前余额（credits 剩余）。
+ * 口径对齐官方客户端「用量明细」页：GET /sash/api/v2/me/usage，返回
+ *   qoderUsage.userQuota.remaining        订阅配额剩余（主口径，截图「剩余 279」）
+ *   qoderUsage.addOnQuota.remaining       附加配额剩余
+ *   qoderUsage.orgResourcePackage.remaining 组织资源包剩余
+ *   qoderUsage.dedicatedResourcePackages[].remaining 个人资源包剩余（截图「剩余 100」）
+ * 余额 = 上述可用的 remaining 之和。
+ */
+async function queryBalance(at, region) {
+  const r = await qoderFetch(region, EP.usage, { headers: authHeaders(at, region) });
+  if (r.status >= 400) {
+    return { ok: false, msg: '余额接口 HTTP ' + r.status + '：' + String(r.text || '').slice(0, 120) };
+  }
+  const root = r.json || {};
+  const u = (root.qoderUsage && typeof root.qoderUsage === 'object') ? root.qoderUsage : root;
+  const pickRemain = (o) => {
+    if (!o || typeof o !== 'object') return null;
+    const v = Number(o.remaining ?? o.remain ?? o.credits ?? null);
+    return Number.isFinite(v) ? v : null;
+  };
+
+  let sum = 0;
+  let found = false;
+  // 订阅配额
+  if (u.userQuota) {
+    const v = pickRemain(u.userQuota);
+    if (v !== null) { sum += v; found = true; }
+  }
+  // 附加配额
+  if (u.addOnQuota) {
+    const v = pickRemain(u.addOnQuota);
+    if (v !== null) { sum += v; found = true; }
+  }
+  // 组织资源包（字段可能是 remaining，也可能是 available）
+  if (u.orgResourcePackage) {
+    const o = u.orgResourcePackage;
+    let v = pickRemain(o);
+    if (v === null && o.available !== undefined) v = Number(o.available);
+    if (Number.isFinite(v)) { sum += v; found = true; }
+  }
+  // 个人资源包列表
+  const packs = Array.isArray(u.dedicatedResourcePackages) ? u.dedicatedResourcePackages : [];
+  for (const p of packs) {
+    let v = pickRemain(p);
+    if (v === null && p.available !== undefined) v = Number(p.available);
+    if (Number.isFinite(v)) { sum += v; found = true; }
+  }
+
+  if (!found) return { ok: false, msg: '余额接口未返回可读额度字段' };
+  return { ok: true, balance: sum };
+}
+
 async function fetchCampaigns(at, acct, env, { risk = true, force = true, version } = {}) {
   const region = regionOf(acct.region);
   const url = EP.campaigns + (force ? '?forceRefresh=true' : '');
@@ -2748,9 +2802,30 @@ async function handleList(request, env) {
   const now = Date.now();
   const today = bjDay(now);
 
+  // 并发查余额：每个账号续期拿 access token → 查 me/usage；失败静默，不阻塞列表
+  const balances = await Promise.all(
+    list.map(async (meta) => {
+      try {
+        const a = await getAccount(env, meta.id);
+        if (!a || !a.refreshToken) return { id: meta.id, ok: false };
+        const at = await refreshAccount(a);
+        // 续期会轮换 refreshToken，回写
+        await putAccount(env, a);
+        const region = regionOf(a.region);
+        const bal = await queryBalance(at, region);
+        return { id: meta.id, ...bal };
+      } catch {
+        return { id: meta.id, ok: false };
+      }
+    })
+  );
+  const balanceById = {};
+  for (const b of balances) balanceById[b.id] = b;
+
   for (const meta of list) {
     const a = await getAccount(env, meta.id);
     if (!a) continue;
+    const bal = balanceById[meta.id] || {};
     out.push({
       id: a.id,
       label: a.label,
@@ -2763,6 +2838,7 @@ async function handleList(request, env) {
       lastCredit: a.lastCredit ?? null,
       totalCredit: a.totalCredit ?? 0,
       totalSigned: a.totalSigned ?? 0,
+      balance: bal.ok && bal.balance !== null && bal.balance !== undefined ? bal.balance : null,
       cooldownUntil: Number(a.cooldownUntil || 0) > now ? a.cooldownUntil : 0,
       today,
       signedToday: a.lastOkDate === today,
@@ -4947,17 +5023,18 @@ function renderQoder(d){
   if(!d.accounts.length){ box.innerHTML = '<div class="empty">还没有账号，点右侧「添加账号（国内版）」</div>'; return; }
   var warn = '';
   box.innerHTML = warn
-    + '<table><thead><tr><th>备注</th><th>状态</th><th>本次</th><th>累计</th><th>上次运行</th><th></th></tr></thead><tbody>'
+    + '<table><thead><tr><th>备注</th><th>状态</th><th>本次</th><th>余额</th><th>上次运行</th><th></th></tr></thead><tbody>'
     + d.accounts.map(function(a){
         var m = msgQoder(a);
         var gain = (a.lastState==='checked' && a.lastCredit!=null) ? '+' + a.lastCredit : '—';
+        var bal = (a.balance!=null) ? fmtNum(a.balance) : '—';
         var rgn = '<span class="rgn" title="国内版 qoder.com.cn">国内版</span>';
         return '<tr>'
           + '<td class="labcell" data-label="备注">' + labCellHtml('qoder', a.id, a.label, rgn) + '</td>'
           + '<td class="st" data-label="状态">' + tagQoder(a, now)
             + (m ? '<div class="hint" style="margin:2px 0 0">' + esc(m) + '</div>' : '') + '</td>'
           + '<td class="num" data-label="本次">' + gain + '</td>'
-          + '<td class="num" data-label="累计">' + fmt(a.totalCredit) + '</td>'
+          + '<td class="num" data-label="余额">' + bal + '</td>'
           + '<td class="time" data-label="上次运行">' + (a.lastRun ? esc(a.lastRun.replace('T',' ').slice(5,16)) : '—') + '</td>'
           + '<td data-label="操作" class="ops">'
             + '<button data-del="qoder|' + esc(a.id) + '">删除</button></td>'
