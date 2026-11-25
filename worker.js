@@ -4973,7 +4973,7 @@ function renderCodeArts(d){
   $('#lastRun-codearts').textContent = lastRunOf(d.accounts);
   $('#cntCodeArts').textContent = d.accounts.filter(function(a){ return a.signedToday; }).length + '/' + d.accounts.length;
   if(!d.accounts.length){ box.innerHTML = '<div class="empty">还没有账号，点右侧「添加账号」</div>'; return; }
-  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>本次</th><th>余额</th><th>累计</th><th>上次运行</th><th></th></tr></thead><tbody>'
+  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>本次</th><th>余额</th><th>上次运行</th><th></th></tr></thead><tbody>'
     + d.accounts.map(function(a){
         var m = msgCodeArts(a);
         var gain = (a.lastState==='checked' && a.lastCredit!=null) ? '+' + a.lastCredit : '—';
@@ -4984,7 +4984,6 @@ function renderCodeArts(d){
             + (m ? '<div class="hint" style="margin:2px 0 0">' + esc(m) + '</div>' : '') + '</td>'
           + '<td class="num" data-label="本次">' + gain + '</td>'
           + '<td class="num" data-label="余额">' + bal + '</td>'
-          + '<td class="num" data-label="累计">' + fmt(a.totalSigned) + '</td>'
           + '<td class="time" data-label="上次运行">' + (a.lastRun ? esc(a.lastRun.replace('T',' ').slice(5,16)) : '—') + '</td>'
           + '<td data-label="操作" class="ops">'
             + '<button data-del="codearts|' + esc(a.id) + '">删除</button></td>'
