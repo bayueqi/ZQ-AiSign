@@ -3311,6 +3311,86 @@ async function welfareCall(acct, path, method, body) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 额度查询：积分余额（主口径）+ token 额度（附带）                       */
+/* 对齐原 ZQ-WTCSign 的 credits()：AK/SK 签名 GET，失败静默。           */
+/* ------------------------------------------------------------------ */
+
+const STATS_PATH = '/snap-manager/v1/statistics/plugin';
+const BENEFIT_HOST = 'https://opengw.developer.huaweicloud.com';
+const TOKEN_BALANCE_PATH = '/api/v1/user/tokens/balance';
+
+function nonNeg(v) {
+  if (typeof v === 'boolean') return null;
+  if (typeof v === 'number' && v >= 0) return v;
+  return null;
+}
+
+function metricNamed(metrics, name) {
+  if (!Array.isArray(metrics)) return {};
+  return metrics.find((it) => it && String(it.name || '') === name) || {};
+}
+
+function creditBlock(metric) {
+  if (!metric) return null;
+  const total = nonNeg(metric.package_credit_amount);
+  const used = nonNeg(metric.package_credit_used);
+  const remain = nonNeg(metric.package_credit_remain);
+  if (total === null && used === null && remain === null) return null;
+  return { total: total || 0, used: used || 0, remain: remain || 0 };
+}
+
+async function signedGet(url, acct) {
+  const headers = await signRequest('GET', url, new Uint8Array(0), acct);
+  let res;
+  try {
+    res = await fetch(url, { method: 'GET', headers });
+  } catch (e) {
+    return { status: -1, text: e.message || String(e) };
+  }
+  const text = await res.text();
+  return { status: res.status, text };
+}
+
+/** 查询账号当前积分余额，返回 { ok, balance, tokenBalance, plan } 或 { ok:false } */
+async function queryCredits(acct) {
+  if (!acct.accessKeyId || !acct.secretAccessKey) return { ok: false };
+
+  let balance = null;
+  let plan = '';
+  let tokenBalance = null;
+
+  // 1) 积分体系（主口径）
+  const r1 = await signedGet(SNAP_HOST + STATS_PATH, acct);
+  if (r1.status === 200) {
+    try {
+      const body = JSON.parse(r1.text);
+      const metrics = body.metrics;
+      const main = creditBlock(metricNamed(metrics, 'usageTotalPackageCredit'));
+      if (main) {
+        balance = main.remain;
+        const pkg = (body.package && typeof body.package === 'object') ? body.package : {};
+        const name = String(pkg.package_name_cn || pkg.package_name_en || pkg.spec_code || '').trim();
+        plan = name || 'CodeArts 积分';
+      }
+    } catch { /* 忽略 */ }
+  }
+
+  // 2) token 额度（附带，失败不影响）
+  const r2 = await signedGet(BENEFIT_HOST + TOKEN_BALANCE_PATH, acct);
+  if (r2.status === 200) {
+    try {
+      const raw = JSON.parse(r2.text);
+      const result = (raw && typeof raw.result === 'object') ? raw.result : {};
+      const b = nonNeg(result.total_balance);
+      if (b !== null) tokenBalance = b;
+    } catch { /* 忽略 */ }
+  }
+
+  if (balance === null && tokenBalance === null) return { ok: false };
+  return { ok: true, balance, tokenBalance, plan };
+}
+
+/* ------------------------------------------------------------------ */
 /* 授权：生成 PKCE + DPoP 私钥，返回官网授权页地址（回调到本机随机端口）*/
 /* ------------------------------------------------------------------ */
 
@@ -3619,12 +3699,29 @@ async function readBody(request) {
 
 async function handleList(request, env) {
   const list = await listAccounts(env);
-  const out = [];
   const now = Date.now();
   const today = bjDay(now);
+
+  // 并发查余额（失败静默，不阻塞列表）；没 AK/SK 的账号跳过
+  const credits = await Promise.all(
+    list.map(async (meta) => {
+      try {
+        const a = await getAccount(env, meta.id);
+        if (!a || !a.accessKeyId || !a.secretAccessKey) return { id: meta.id, ok: false };
+        return { id: meta.id, ...(await queryCredits(a)) };
+      } catch {
+        return { id: meta.id, ok: false };
+      }
+    })
+  );
+  const creditById = {};
+  for (const c of credits) creditById[c.id] = c;
+
+  const out = [];
   for (const meta of list) {
     const a = await getAccount(env, meta.id);
     if (!a) continue;
+    const cr = creditById[meta.id] || {};
     out.push({
       id: a.id,
       label: a.label,
@@ -3634,6 +3731,9 @@ async function handleList(request, env) {
       lastOkDate: a.lastOkDate ?? null,
       lastCredit: a.lastCredit ?? null,
       totalSigned: a.totalSigned ?? 0,
+      balance: cr.ok && cr.balance !== null && cr.balance !== undefined ? cr.balance : null,
+      tokenBalance: cr.ok && cr.tokenBalance !== null && cr.tokenBalance !== undefined ? cr.tokenBalance : null,
+      plan: cr.plan || '',
       cooldownUntil: Number(a.cooldownUntil || 0) > now ? a.cooldownUntil : 0,
       today,
       signedToday: a.lastOkDate === today,
@@ -4803,15 +4903,17 @@ function renderCodeArts(d){
   $('#lastRun-codearts').textContent = lastRunOf(d.accounts);
   $('#cntCodeArts').textContent = d.accounts.filter(function(a){ return a.signedToday; }).length + '/' + d.accounts.length;
   if(!d.accounts.length){ box.innerHTML = '<div class="empty">还没有账号，点右侧「添加账号」</div>'; return; }
-  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>本次</th><th>累计</th><th>上次运行</th><th></th></tr></thead><tbody>'
+  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>本次</th><th>余额</th><th>累计</th><th>上次运行</th><th></th></tr></thead><tbody>'
     + d.accounts.map(function(a){
         var m = msgCodeArts(a);
         var gain = (a.lastState==='checked' && a.lastCredit!=null) ? '+' + a.lastCredit : '—';
+        var bal = (a.balance!=null) ? fmt(a.balance) : '—';
         return '<tr>'
           + '<td class="labcell" data-label="备注">' + labCellHtml('codearts', a.id, a.label) + '</td>'
           + '<td class="st" data-label="状态">' + tagCodeArts(a, now)
             + (m ? '<div class="hint" style="margin:2px 0 0">' + esc(m) + '</div>' : '') + '</td>'
           + '<td class="num" data-label="本次">' + gain + '</td>'
+          + '<td class="num" data-label="余额">' + bal + '</td>'
           + '<td class="num" data-label="累计">' + fmt(a.totalSigned) + '</td>'
           + '<td class="time" data-label="上次运行">' + (a.lastRun ? esc(a.lastRun.replace('T',' ').slice(5,16)) : '—') + '</td>'
           + '<td data-label="操作" class="ops">'
