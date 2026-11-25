@@ -1730,6 +1730,34 @@ async function checkinStatus(at) {
   return { ok: true, data: json.data };
 }
 
+/**
+ * 查询当前剩余额度（真正的「余额」）。
+ * 口径对齐官方客户端：POST /v2/billing/meter/get-user-resource-summary，
+ * data.TotalCredits 是实时剩余；老的 checkin-activity-status 里的
+ * total_credits 是「累计发放量」，只增不减，拿来做余额会一直不变。
+ */
+async function queryBalance(at) {
+  const { status, json } = await wbFetch('/v2/billing/meter/get-user-resource-summary', {
+    headers: authHeader(at),
+  });
+  if (json?.code !== 0 || !json?.data) {
+    return { ok: false, code: json?.code, msg: json?.msg, http: status };
+  }
+  const d = json.data;
+  // TotalCredits 实时剩余；取不到时退回 CreditGroups 的 CycleRemainCapacity 之和
+  let remain = d.TotalCredits;
+  if (remain === null || remain === undefined || remain === '') {
+    const groups = Array.isArray(d.CreditGroups) ? d.CreditGroups : [];
+    remain = groups.reduce((acc, g) => {
+      const v = parseFloat(g && (g.CycleRemainCapacity ?? g.cycleRemainCapacity));
+      return acc + (isNaN(v) ? 0 : v);
+    }, 0);
+  }
+  const num = parseFloat(remain);
+  if (isNaN(num)) return { ok: false, msg: '额度接口未返回可读字段' };
+  return { ok: true, balance: num };
+}
+
 async function doCheckin(at) {
   const { json } = await wbFetch('/v2/billing/meter/daily-checkin', {
     headers: authHeader(at),
@@ -1901,10 +1929,37 @@ async function handleLoginPoll(request, env) {
 
 async function handleList(request, env) {
   const list = await listAccounts(env);
+  const now = Date.now();
+  const today = new Date(now + 8 * 3600 * 1000).toISOString().slice(0, 10);
+
+  // 并发查余额：每个账号刷令牌 → 查 get-user-resource-summary；失败静默，不阻塞列表
+  const balances = await Promise.all(
+    list.map(async (meta) => {
+      try {
+        const a = await getAccount(env, meta.id);
+        if (!a || !a.refreshToken) return { id: meta.id, ok: false };
+        const tokens = await refreshTokens(a.refreshToken);
+        // 令牌轮换了，回写新的 refreshToken，避免下次又要从旧链刷新失败
+        if (tokens.refreshToken && tokens.refreshToken !== a.refreshToken) {
+          a.refreshToken = tokens.refreshToken;
+          a.tokenRefreshedAt = now;
+          await putAccount(env, a);
+        }
+        const bal = await queryBalance(tokens.accessToken);
+        return { id: meta.id, ...bal };
+      } catch {
+        return { id: meta.id, ok: false };
+      }
+    })
+  );
+  const balanceById = {};
+  for (const b of balances) balanceById[b.id] = b;
+
   const out = [];
   for (const meta of list) {
     const a = await getAccount(env, meta.id);
     if (!a) continue;
+    const bal = balanceById[meta.id] || {};
     out.push({
       id: a.id,
       label: a.label,
@@ -1913,7 +1968,7 @@ async function handleList(request, env) {
       lastRun: a.lastRun ? new Date(a.lastRun + 8 * 3600e3).toISOString().replace('Z', ' +08:00') : null,
       lastOkDate: a.lastOkDate ?? null,
       streak: a.streak ?? null,
-      total: a.total ?? null,
+      balance: bal.ok && bal.balance !== null && bal.balance !== undefined ? bal.balance : null,
       totalSigned: a.totalSigned ?? 0,
       // 永远不返回令牌，连指纹都不给
     });
@@ -4667,6 +4722,13 @@ function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];
 }); }
 function fmt(n){ return n==null||n==='' ? '—' : String(n); }
+/* 余额可能是小数（如 1068.29），收敛到两位，整数的省略小数部分 */
+function fmtNum(n){
+  if(n==null||n===''||isNaN(Number(n))) return '—';
+  var v = Number(n);
+  if(Math.abs(v - Math.round(v)) < 1e-6) return String(Math.round(v));
+  return String(parseFloat(v.toFixed(2)));
+}
 
 /* 状态由服务端按当天判定（signedToday / ranToday），前端不自行推测 */
 function bjToday(){
@@ -4852,7 +4914,7 @@ function renderWb(d){
   $('#lastRun-wb').textContent = lastRunOf(d.accounts);
   $('#cntWb').textContent = d.accounts.filter(function(a){ return a.signedToday; }).length + '/' + d.accounts.length;
   if(!d.accounts.length){ box.innerHTML = '<div class="empty">还没有账号，右侧扫码添加</div>'; return; }
-  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>连签</th><th>本期</th><th>上次运行</th><th></th></tr></thead><tbody>'
+  box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>连签</th><th>余额</th><th>上次运行</th><th></th></tr></thead><tbody>'
     + d.accounts.map(function(a){
         var m = msgWb(a);
         return '<tr>'
@@ -4860,7 +4922,7 @@ function renderWb(d){
           + '<td class="st" data-label="状态">' + tagWb(a)
             + (m ? '<div class="hint" style="margin:2px 0 0">' + esc(m) + '</div>' : '') + '</td>'
           + '<td class="num" data-label="连签">' + (a.streak==null ? '—' : a.streak + ' 天') + '</td>'
-          + '<td class="num" data-label="本期">' + fmt(a.total) + '</td>'
+          + '<td class="num" data-label="余额">' + (a.balance==null ? '—' : fmtNum(a.balance)) + '</td>'
           + '<td class="time" data-label="上次运行">' + (a.lastRun ? esc(a.lastRun.replace('T',' ').slice(5,16)) : '—') + '</td>'
           + '<td data-label="操作"><button data-del="wb|' + esc(a.id) + '">删除</button></td>'
           + '</tr>';
