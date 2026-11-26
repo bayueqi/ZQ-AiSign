@@ -3850,6 +3850,7 @@ async function runAll(env, origin, force) {
   try {
     const n = await notifyRun(env, result);
     if (n && n.errors) result.notifyError = n.errors;
+    else if (n && n.skipped) result.notifySkipped = true;
   } catch (err) {
     result.notifyError = [String(err.message || err)];
   }
@@ -4063,7 +4064,7 @@ async function notifyRun(env, result) {
 /* ------------------------------------------------------------------ */
 
 /* 页面版本号：改这个就能确认线上跑的是不是新代码（问「改了怎么没生效」时先看它） */
-const BUILD = '2026-11-25';
+const BUILD = '2026-11-26';
 
 const PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -5407,25 +5408,23 @@ export default {
     }
   },
 
-  /** Cloudflare Cron Trigger：四个平台依次签到，互不影响 */
+  /** Cloudflare Cron Trigger：走和「全部签到」同一条 runAll 链路，末尾统一发通知 */
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
-        const pending = [];
-        const sink = { waitUntil: (p) => pending.push(p) };
-        for (const [mod, e] of [
-          [Trae, traeEnv(env)],
-          [WorkBuddy, wbEnv(env)],
-          [Qoder, qoderEnv(env)],
-          [CodeArts, codeartsEnv(env)],
-        ]) {
-          try {
-            await mod.scheduled({}, e, sink);
-          } catch {
-            /* 一个平台整体失败不影响另一个 */
+        try {
+          // 不要在这里直接调各模块的 scheduled：
+          // 那条路径只签到，不汇总结果、不调 notifyRun，Telegram 通知会被整段跳过。
+          // runAll 会依次驱动四个平台的 /api/run，并在最后统一调用 notifyRun。
+          const result = await runAll(env, 'https://zq-aisign.internal', false);
+          if (result && result.notifyError) {
+            console.error('[cron] 通知发送失败:', result.notifyError.join('; '));
+          } else if (result && result.notifySkipped) {
+            console.warn('[cron] 未配置通知渠道，已跳过通知');
           }
+        } catch (e) {
+          console.error('[cron] 定时任务异常:', e && (e.stack || e.message || e));
         }
-        await Promise.allSettled(pending);
       })()
     );
   },
